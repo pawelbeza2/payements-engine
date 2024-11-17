@@ -1,6 +1,28 @@
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
+pub struct TransactionDetails {
+    pub amount: Decimal,
+    pub disputed: bool,
+}
+
+impl TransactionDetails {
+    pub fn new(amount: Decimal) -> TransactionDetails {
+        TransactionDetails {
+            amount,
+            disputed: false,
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum TransactionValidationError {
+    #[error("Amount is missing")]
+    AmountMissing,
+    #[error("Amount is negative")]
+    AmountNegative,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Transaction {
     pub r#type: TransactionType,
@@ -12,19 +34,15 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    // Validate the transaction
-    //
-    // A transaction is valid in the following cases:
-    // * type in [deposit, withdrawal] and (amount is present and non neagtive)
-    // * type in [dispute, resolve, chargeback] and amount is not present
-    pub fn is_valid(&self) -> bool {
-        match self.r#type {
-            TransactionType::Deposit | TransactionType::Withdraw => {
-                self.amount.is_some() && self.amount.unwrap() >= Decimal::ZERO
+    pub fn get_amount_or_error(&self) -> Result<Decimal, TransactionValidationError> {
+        match self.amount {
+            Some(amount) => {
+                if amount.is_sign_negative() {
+                    return Err(TransactionValidationError::AmountNegative.into());
+                }
+                Ok(amount)
             }
-            TransactionType::Dispute | TransactionType::Resolve | TransactionType::Chargeback => {
-                self.amount.is_none()
-            }
+            None => Err(TransactionValidationError::AmountMissing.into()),
         }
     }
 }
@@ -41,88 +59,4 @@ pub enum TransactionType {
     Resolve,
     #[serde(rename = "chargeback")]
     Chargeback,
-}
-
-#[cfg(test)]
-mod tests {
-    use rust_decimal::Decimal;
-
-    use super::{Transaction, TransactionType};
-
-    #[test]
-    fn test_is_valid() {
-        let valid_transactions = [
-            Transaction {
-                r#type: TransactionType::Deposit,
-                client_id: 1,
-                transaction_id: 1,
-                amount: Some(Decimal::new(1, 4)),
-            },
-            Transaction {
-                r#type: TransactionType::Withdraw,
-                client_id: 1,
-                transaction_id: 1,
-                amount: Some(Decimal::new(1, 4)),
-            },
-            Transaction {
-                r#type: TransactionType::Dispute,
-                client_id: 1,
-                transaction_id: 1,
-                amount: None,
-            },
-            Transaction {
-                r#type: TransactionType::Resolve,
-                client_id: 1,
-                transaction_id: 1,
-                amount: None,
-            },
-            Transaction {
-                r#type: TransactionType::Chargeback,
-                client_id: 1,
-                transaction_id: 1,
-                amount: None,
-            },
-        ];
-
-        for transaction in valid_transactions.iter() {
-            assert!(transaction.is_valid());
-        }
-
-        let invalid_transactions = [
-            Transaction {
-                r#type: TransactionType::Deposit,
-                client_id: 1,
-                transaction_id: 1,
-                amount: None,
-            },
-            Transaction {
-                r#type: TransactionType::Withdraw,
-                client_id: 1,
-                transaction_id: 1,
-                amount: None,
-            },
-            Transaction {
-                r#type: TransactionType::Dispute,
-                client_id: 1,
-                transaction_id: 1,
-                amount: Some(Decimal::new(1, 4)),
-            },
-            Transaction {
-                r#type: TransactionType::Resolve,
-                client_id: 1,
-                transaction_id: 1,
-                amount: Some(Decimal::new(1, 4)),
-            },
-            Transaction {
-                r#type: TransactionType::Chargeback,
-                client_id: 1,
-                transaction_id: 1,
-                amount: Some(Decimal::new(1, 4)),
-            },
-        ];
-
-        for transaction in invalid_transactions.iter() {
-            assert!(!transaction.is_valid());
-        }
-    }
 }

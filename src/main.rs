@@ -1,9 +1,12 @@
-use std::{env};
+use std::env;
 
 mod engine;
 use engine::Engine;
 
-fn main() -> anyhow::Result<()>  {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::new().default_filter_or("error")).init();
+
     let file_path = match env::args().nth(1) {
         None => Err(anyhow::anyhow!("Expecting one argument")),
         Some(file_path) => Ok(file_path),
@@ -15,7 +18,7 @@ fn main() -> anyhow::Result<()>  {
         .from_path(file_path)?;
 
     let mut engine = Engine::new();
-    if let Err(e) = engine.process_transactions(reader.into_deserialize()) {
+    if let Err(e) = engine.process_transactions(reader.into_deserialize()).await {
         return Err(anyhow::anyhow!("Error processing transactions: {}", e));
     }
 

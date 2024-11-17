@@ -1,245 +1,98 @@
 use anyhow::Result;
-use std::error::Error;
+use dashmap::DashMap;
+use std::{error::Error, sync::Arc};
 
-use super::account::TransactionDetails;
-use super::transaction::Transaction;
-use super::{account, Account, TransactionType};
+use super::account::Account;
+use super::account_manager::{AccountManager, AccountManagerError};
+use super::transaction::{Transaction, TransactionType, TransactionValidationError};
 
 use log::warn;
 
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum EngineError {
+    #[error("Transaction validation error: {0}")]
+    TransactionValidationError(#[from] TransactionValidationError),
+    #[error("AccountManager error: {0}")]
+    AccountManagerError(#[from] AccountManagerError),
+}
+
 pub struct Engine {
-    accounts: std::collections::HashMap<u16, account::Account>,
+    accounts: Arc<DashMap<u16, AccountManager>>,
 }
 
 impl Engine {
     pub fn new() -> Engine {
         Engine {
-            accounts: std::collections::HashMap::new(),
+            accounts: Arc::new(DashMap::new()),
         }
     }
 
-    pub fn accounts(&self) -> Result<Vec<&Account>> {
-        Ok(self.accounts.values().collect())
+    pub fn accounts(&self) -> Result<Vec<Account>> {
+        Ok(self
+            .accounts
+            .iter()
+            .map(|acc| acc.value().account.clone())
+            .collect())
     }
 
-    pub fn process_transactions<I, E>(&mut self, transacations_iter: I) -> Result<()>
+    pub async fn process_transactions<I, E>(&mut self, transacations_iter: I) -> Result<()>
     where
         I: Iterator<Item = std::result::Result<Transaction, E>>,
         E: Error + Sync + Send + 'static,
     {
         for transaction in transacations_iter {
-            self.process_transaction(transaction?)?;
+            if let Ok(transaction) = transaction {
+                let transaction_id = transaction.transaction_id;
+                let accounts = Arc::clone(&self.accounts);
+                if let Err(e) = Self::process_transaction(accounts, transaction).await {
+                    // Log error and continue processing
+                    warn!("Error processing transaction {}: {}", transaction_id, e);
+                }
+            }
         }
 
         Ok(())
     }
 
-    fn process_transaction(&mut self, transaction: Transaction) -> Result<()> {
-        let transaction_id = transaction.transaction_id;
-
-        // Check if the transaction is valid
-        if !transaction.is_valid() {
-            return Err(anyhow::anyhow!(
-                "Invalid transaction: {}",
-                transaction_id
-            ));
-        }
-
-        // Check that the account exists.
-        // If it doesn't, create a new account.
-        let acc = self
-            .accounts
+    pub async fn process_transaction(
+        accounts: Arc<DashMap<u16, AccountManager>>,
+        transaction: Transaction,
+    ) -> Result<(), EngineError> {
+        // Get existing or create new account manager
+        let mut account_manager = accounts
             .entry(transaction.client_id)
-            .or_insert(Account::new(transaction.client_id));
-
-        // If the account is locked, ignore the transaction
-        // Log attempt to make transaction on locked account
-        if acc.locked {
-            warn!(
-                "Attempt to make transaction on locked account: {}",
-                transaction_id
-            );
-            return Ok(());
-        }
+            .or_insert(AccountManager::new(transaction.client_id));
 
         // Process the transaction
-        let result = match transaction.r#type {
-            TransactionType::Deposit => self.deposit(transaction),
-            TransactionType::Withdraw => self.withdraw(transaction),
-            TransactionType::Dispute => self.dispute(transaction),
-            TransactionType::Resolve => self.resolve(transaction),
-            TransactionType::Chargeback => self.chargeback(transaction),
+        let transaction_id = transaction.transaction_id;
+        return match transaction.r#type {
+            TransactionType::Deposit => {
+                let amount = transaction.get_amount_or_error()?;
+                account_manager
+                    .deposit(transaction_id, amount)
+                    .map_err(EngineError::from)
+            }
+            TransactionType::Withdraw => {
+                let amount = transaction.get_amount_or_error()?;
+                account_manager.withdraw(amount).map_err(EngineError::from)
+            }
+            TransactionType::Dispute => account_manager
+                .dispute(transaction_id)
+                .map_err(EngineError::from),
+            TransactionType::Resolve => account_manager
+                .resolve(transaction_id)
+                .map_err(EngineError::from),
+            TransactionType::Chargeback => account_manager
+                .chargeback(transaction_id)
+                .map_err(EngineError::from),
         };
-        
-        if result.is_err() {
-            warn!(
-                "Error processing transaction: {} {}",
-                transaction_id, result.unwrap_err()
-            );
-        }
-
-        Ok(())
-    }
-
-    // Deposit funds into account.
-    //
-    // * Increment available balance by the transaction amount
-    // * Record the transaction (we need only the amount)
-    fn deposit(&mut self, transaction: Transaction) -> Result<()> {
-        let amount = transaction
-            .amount
-            .ok_or_else(|| anyhow::anyhow!("Deposit: presence of amount field should be asserted before calling deposit"))?;
-        let account = self
-            .accounts
-            .get_mut(&transaction.client_id)
-            .ok_or_else(|| anyhow::anyhow!("Deposit: existance of account should be asserted before calling deposit"))?;
-
-        account.available += amount;
-        account
-            .transactions
-            .insert(transaction.transaction_id, TransactionDetails::new(amount));
-
-        Ok(())
-    }
-
-    // Withdraw funds from account.
-    //
-    // * Decrement available balance by the transaction amount
-    // * Record the transaction (we need only the amount)
-    fn withdraw(&mut self, transaction: Transaction) -> Result<()> {
-        let account = self
-            .accounts
-            .get_mut(&transaction.client_id)
-            .ok_or_else(|| anyhow::anyhow!("Withdraw: account with client_id does not exist
-                Existance of account should be asserted before calling withdraw"))?;
-        let amount = transaction.amount.ok_or_else(|| anyhow::anyhow!(
-            "Withdraw: presence of amount field should be asserted before calling withdraw",
-        ))?;
-
-        if account.available < amount {
-            warn!(
-                "Attempt to withdraw more funds than available",
-            );
-            return Ok(());
-        }
-
-        account.available -= amount;
-        account
-            .transactions
-            .insert(transaction.transaction_id, TransactionDetails::new(amount));
-
-        Ok(())
-    }
-
-    // Dispute a transaction.
-    //
-    // * Move the transaction amount from available to held
-    // * Mark the transaction as disputed
-    fn dispute(&mut self, transaction: Transaction) -> Result<()> {
-        let account = self
-            .accounts
-            .get_mut(&transaction.client_id)
-            .ok_or_else(|| anyhow::anyhow!("Dispute: account with client_id {} does not exist. 
-                Existance should be asserted before calling dispute", transaction.client_id))?;
-
-        let disputed_transaction = account
-            .transactions
-            .get_mut(&transaction.transaction_id)
-            .ok_or_else(|| anyhow::anyhow!("Dispute: transaction does not exist.
-                Existance should be asserted before calling dispute"))?;
-
-
-        if disputed_transaction.disputed {
-            warn!(
-                "Attempt to dispute already disputed transaction",
-            );
-            return Ok(());
-        }
-
-        if disputed_transaction.amount > account.available {
-            warn!(
-                "Attempt to dispute transaction with insufficient funds",
-            );
-            return Ok(());
-        }
-
-        account.available -= disputed_transaction.amount;
-        account.held += disputed_transaction.amount;
-        disputed_transaction.disputed = true;
-
-        Ok(())
-    }
-
-    // Resolve a dispute.
-    //
-    // * Move the transaction amount from held to available
-    // * Mark the transaction as not disputed
-    fn resolve(&mut self, transaction: Transaction) -> Result<()> {
-        let account = self
-            .accounts
-            .get_mut(&transaction.client_id)
-            .ok_or_else(|| anyhow::anyhow!("Resolve: account with client_id {} does not exist.
-                Existance should be asserted before calling resolve", transaction.client_id))?;
-
-        let disputed_transaction = account
-            .transactions
-            .get_mut(&transaction.transaction_id)
-            .ok_or_else(|| anyhow::anyhow!("Resolve: transaction does not exist.
-                Existance should be asserted before calling resolve"))?;
-
-        if !disputed_transaction.disputed {
-            warn!("Attempt to resolve non-disputed transaction");
-            return Ok(());
-        }
-
-        if disputed_transaction.amount > account.held {
-            return Err(anyhow::anyhow!(
-                "Resolve: Insufficient funds. This shuld never happen, held should never fall below amount.
-                    Double check that we properly block transactions from blocked accounts.",
-            ));
-        }
-
-        account.available += disputed_transaction.amount;
-        account.held -= disputed_transaction.amount;
-        disputed_transaction.disputed = false;
-
-        Ok(())
-    }
-
-    fn chargeback(&mut self, transaction: Transaction) -> Result<()> {
-        let account = self.accounts.get_mut(&transaction.client_id).ok_or_else(|| anyhow::anyhow!(
-            "Chargeback: existance of account should be asserted before calling chargeback",
-        ))?;
-
-        let disputed_transaction = account
-            .transactions
-            .get_mut(&transaction.transaction_id)
-            .ok_or_else(|| anyhow::anyhow!("Chargeback: disputed transaction not found"))?;
-
-        if !disputed_transaction.disputed {
-            warn!(
-                "Attempt to chargeback non-disputed transaction",
-            );
-            return Ok(());
-        }
-
-        if disputed_transaction.amount > account.held {
-            return Err(anyhow::anyhow!(
-                "Chargeback: Insufficient funds. This should never happen, held should never fall below amount.
-                    Double check that we allow to chargeback only disputed transactions.",
-            ));
-        }
-
-        account.held -= disputed_transaction.amount;
-        account.locked = true;
-
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::Engine;
+    use tokio::test;
 
     // Helper macro to read transaction records from a string, process them and compare them to the expected output.
     macro_rules! assert_account_balance {
@@ -265,6 +118,7 @@ mod tests {
             // Process transactions
             engine
                 .process_transactions(reader.into_deserialize())
+                .await
                 .unwrap();
 
             // Get and sort accounts
@@ -290,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deposits() {
+    async fn test_deposits() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -307,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deposits_withdrawals_zero_balance() {
+    async fn test_deposits_withdrawals_zero_balance() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -324,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_withdrawals_positive_balance() {
+    async fn test_withdrawals_positive_balance() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -341,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_withdrawals_negative_balance() {
+    async fn test_withdrawals_negative_balance() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -358,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispute() {
+    async fn test_dispute() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -375,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispute_with_nonexisting_id() {
+    async fn test_dispute_with_nonexisting_id() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -392,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispute_with_insufficient_funds() {
+    async fn test_dispute_with_insufficient_funds() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -409,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolution() {
+    async fn test_resolution() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -427,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolution_with_nonexisting_id() {
+    async fn test_resolution_with_nonexisting_id() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -445,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolution_without_dispute() {
+    async fn test_resolution_without_dispute() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -462,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chargeback() {
+    async fn test_chargeback() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -480,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_after_freeze() {
+    async fn test_transaction_after_freeze() {
         assert_account_balance!(
             "
                 type,client,tx,amount
@@ -499,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chargeback_without_dispute() {
+    async fn test_chargeback_without_dispute() {
         assert_account_balance!(
             "
                 type,client,tx,amount

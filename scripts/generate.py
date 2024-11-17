@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 
 import random
+import sys
+
+if len(sys.argv) != 2:
+        print("Usage: generate.py <num_records>")
+        sys.exit(1)
+
+num_records = int(sys.argv[1])
 
 print('type,client,tx,amount')
 
@@ -16,7 +23,7 @@ max_client_id = 0
 disputed_tx_ids = []
 output = []
 
-for tx_id in range(1000000):
+for tx_id in range(num_records):
     # Generate random deposit or withdrawal
     basic_transaction = random.choice(list(basic_transactions.values()))
     if random.random() < 0.75:

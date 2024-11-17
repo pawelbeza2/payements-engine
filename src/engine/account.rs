@@ -1,29 +1,12 @@
-use std::collections::HashMap;
-
 use rust_decimal::Decimal;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 
-pub struct TransactionDetails {
-    pub amount: Decimal,
-    pub disputed: bool,
-}
-
-impl TransactionDetails {
-    pub fn new(amount: Decimal) -> TransactionDetails {
-        TransactionDetails {
-            amount,
-            disputed: false,
-        }
-    }
-}
-
+#[derive(Clone)]
 pub struct Account {
     pub client_id: u16,
     pub available: Decimal,
     pub held: Decimal,
     pub locked: bool,
-
-    pub transactions: HashMap<u32, TransactionDetails>,
 }
 
 impl Account {
@@ -33,8 +16,6 @@ impl Account {
             available: Decimal::new(0, 4),
             held: Decimal::new(0, 4),
             locked: false,
-
-            transactions: HashMap::new(),
         }
     }
 
@@ -55,7 +36,7 @@ impl Serialize for Account {
             }
             return value_str;
         }
-        
+
         let mut state: <S as Serializer>::SerializeStruct =
             serializer.serialize_struct("Account", 5)?;
         state.serialize_field("client", &self.client_id)?;
